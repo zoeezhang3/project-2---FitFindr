@@ -64,9 +64,54 @@ If `outfit` is empty or whitespace-only, the tool returns a descriptive error **
 
 ---
 
-### Additional Tools (if any)
+### Additional Tools
 
-None for the core build. (Stretch idea: a `parse_query` LLM tool to extract `description`/`size`/`max_price` from free text — for the core build this parsing lives inline in the planning loop, see below.)
+The four stretch features below are implemented in `tools.py` (Tools 4–6) and `agent.py` (Feature 7). Each was spec'd here before being built.
+
+#### Tool 4: estimate_price_fairness (price comparison)
+
+**What it does:**
+Given a listing, estimates whether its price is fair by comparing it to comparable items already in the dataset (same `category`, weighted toward listings that share `style_tags`). Pure data — no LLM call.
+
+**Input parameters:**
+- `item` (dict): A listing dict (typically `session["selected_item"]`). Uses its `category`, `style_tags`, and `price`.
+
+**What it returns:**
+A `dict`: `{"verdict": str, "item_price": float, "comp_count": int, "comp_median": float | None, "comp_low": float | None, "comp_high": float | None, "summary": str}`. `verdict` is one of `"great deal"`, `"fair"`, `"overpriced"` (or `"no comparables"`). The verdict compares `item_price` against the median of comparables: ≤ 0.85× median → great deal, ≥ 1.15× median → overpriced, else fair. `summary` is a one-line human-readable string for the UI.
+
+**What it fails / returns nothing:**
+If there are no other items in the same category (no comparables), it returns `verdict="no comparables"` with `comp_median=None` and a summary saying it can't assess fairness — it never raises and never divides by zero.
+
+#### Tool 5: style profile memory (cross-session persistence)
+
+**What it does:**
+Lets the agent remember a user's style preferences (preferred styles, sizes, price ceiling, optional saved wardrobe) across sessions by persisting them to a JSON file on disk, so the user doesn't re-describe their taste every time.
+
+**Input parameters:**
+- `save_style_profile(profile: dict, path: str | None = None) -> str`: persists the profile dict to JSON. `profile` may hold keys like `preferred_styles` (list[str]), `sizes` (list[str]), `max_price` (float), `wardrobe` (dict). `path` defaults to `style_profile.json` in the project root.
+- `load_style_profile(path: str | None = None) -> dict`: reads and returns the profile dict.
+- `update_style_profile_from_query(parsed: dict, path=None) -> dict`: convenience — merges a parsed query's `size`/`max_price`/style keywords into the stored profile and saves it.
+
+**What it returns:**
+`save_style_profile` returns a confirmation string with the path. `load_style_profile` returns the stored dict, or a default empty profile `{"preferred_styles": [], "sizes": [], "max_price": None, "wardrobe": {"items": []}}` if the file is missing or unreadable. `update_style_profile_from_query` returns the merged profile.
+
+**What it fails / returns nothing:**
+A missing or corrupt profile file is **not** an error — `load_style_profile` returns the default empty profile so a first-time user works exactly like the existing empty-wardrobe path. Write errors are caught and surfaced as a message string, not an exception.
+
+#### Tool 6: get_trending_styles (trend awareness)
+
+**What it does:**
+Surfaces which styles are currently popular in the user's size range by tallying the most common `style_tags` across listings that match that size. This is a **mock stand-in** for a real public-platform API (e.g. Depop/Poshmark trending tags) — it derives "what's trending" from the local dataset so it runs offline and deterministically, but the signature is shaped so a real API could drop in later.
+
+**Input parameters:**
+- `size` (str | None): Size to scope the trend scan to (case-insensitive substring match, same rule as `search_listings`). `None` scans the whole dataset.
+- `top_n` (int): How many trending tags to return (default 5).
+
+**What it returns:**
+A `dict`: `{"size": str | None, "sample_size": int, "trending": list[tuple[str, int]], "summary": str}` where `trending` is the top `style_tags` and their counts, highest first, and `summary` is a UI-ready sentence ("In size M, trending right now: vintage, 90s, streetwear…").
+
+**What it fails / returns nothing:**
+If no listings match the size, it returns `sample_size=0`, `trending=[]`, and a summary saying there's not enough data for that size — it never raises.
 
 ---
 
@@ -79,8 +124,11 @@ The loop is deterministic and linear with two early-exit branches. It runs insid
 1. **Init.** `session = _new_session(query, wardrobe)`.
 2. **Parse query → `session["parsed"]`.** Extract `description`, `size`, `max_price` from the free-text query. `max_price` comes from a regex on `$NN` / `under NN`; `size` from a regex for `size X` or a standalone token like `M`/`S`/`L`/`XL` / a US shoe size; `description` is the leftover keywords with the price/size phrases stripped out. Store as `{"description": ..., "size": ... or None, "max_price": ... or None}`.
    - **Branch A (empty query):** if `description` is blank after parsing, set `session["error"] = "Tell me what you're looking for — e.g. 'vintage graphic tee under $30, size M'."` and `return session`.
-3. **Search.** `results = search_listings(parsed["description"], parsed["size"], parsed["max_price"])`; store in `session["search_results"]`.
-   - **Branch B (no results):** `if not results:` set `session["error"]` to a specific message naming the likely-too-strict filter (price/size/keywords) and `return session` early. **Do not** call `suggest_outfit`.
+3. **Search (with retry/fallback — Feature 7).** `results = search_listings(parsed["description"], parsed["size"], parsed["max_price"])`; store in `session["search_results"]`.
+   - **Branch B (no results → retry, then maybe error):** if `results` is empty, automatically retry with progressively loosened constraints instead of failing immediately:
+     1. Retry with the **size filter removed** (keep description + price).
+     2. If still empty, retry with **price filter removed** too (description only).
+     Each loosening that produces results records a human-readable note in `session["adjustments"]` (e.g. `"ignored the size M filter"`, `"ignored the under-$30 budget"`). The agent uses the first non-empty retry and continues to Step 4, surfacing the adjustments to the user ("Couldn't find an exact match, so I broadened your search: ignored the size M filter."). Only if **every** retry is still empty does it set `session["error"]` (naming the keywords as the likely problem) and `return session` early. It never calls `suggest_outfit` with empty input.
 4. **Select.** `session["selected_item"] = results[0]` (top-scored match).
 5. **Suggest outfit.** `session["outfit_suggestion"] = suggest_outfit(selected_item, session["wardrobe"])`, wrapped in try/except; on exception set `session["error"]` to an LLM-unavailable message and `return session`.
 6. **Fit card.** Only if `outfit_suggestion` is a non-empty string: `session["fit_card"] = create_fit_card(outfit_suggestion, selected_item)` (also try/except guarded).

@@ -11,7 +11,16 @@ import os
 
 import pytest
 
-from tools import search_listings, suggest_outfit, create_fit_card
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    estimate_price_fairness,
+    get_trending_styles,
+    load_style_profile,
+    save_style_profile,
+    update_style_profile_from_query,
+)
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 needs_groq = pytest.mark.skipif(
@@ -95,3 +104,93 @@ def test_create_fit_card_varies_on_repeat():
     cards = {create_fit_card(outfit, item) for _ in range(3)}
     # Higher temperature should produce at least 2 distinct captions out of 3.
     assert len(cards) >= 2
+
+
+# ── Tool 4: estimate_price_fairness ─────────────────────────────────────────
+
+def test_price_fairness_returns_verdict():
+    item = search_listings("vintage graphic tee", size=None, max_price=50)[0]
+    result = estimate_price_fairness(item)
+    assert result["verdict"] in {"great deal", "fair", "overpriced", "no comparables"}
+    assert result["item_price"] == item["price"]
+    assert isinstance(result["summary"], str) and result["summary"]
+
+
+def test_price_fairness_cheap_item_is_deal():
+    # A cheap top relative to its comparables should read as a good deal.
+    cheap = search_listings("henley", size=None, max_price=None)[0]  # $16 henley
+    result = estimate_price_fairness(cheap)
+    assert result["comp_count"] > 0
+    assert result["verdict"] in {"great deal", "fair"}
+
+
+def test_price_fairness_no_comparables_does_not_crash():
+    # Fabricate an item in a category with no other members.
+    lonely = {
+        "id": "fake_x",
+        "title": "Mystery Object",
+        "category": "spaceship",
+        "style_tags": ["alien"],
+        "price": 999.0,
+    }
+    result = estimate_price_fairness(lonely)
+    assert result["verdict"] == "no comparables"
+    assert result["comp_median"] is None
+
+
+# ── Tool 6: get_trending_styles ─────────────────────────────────────────────
+
+def test_trending_styles_returns_ranked_tags():
+    result = get_trending_styles(size=None, top_n=5)
+    assert result["sample_size"] > 0
+    assert len(result["trending"]) <= 5
+    counts = [count for _, count in result["trending"]]
+    assert counts == sorted(counts, reverse=True)  # highest first
+
+
+def test_trending_styles_unknown_size_is_empty():
+    result = get_trending_styles(size="ZZZ", top_n=5)
+    assert result["sample_size"] == 0
+    assert result["trending"] == []
+    assert "Not enough" in result["summary"]
+
+
+# ── Tool 5: style profile memory ────────────────────────────────────────────
+
+def test_style_profile_missing_file_returns_default(tmp_path):
+    path = str(tmp_path / "nope.json")
+    profile = load_style_profile(path)
+    assert profile == {
+        "preferred_styles": [],
+        "sizes": [],
+        "max_price": None,
+        "wardrobe": {"items": []},
+    }
+
+
+def test_style_profile_save_and_load_roundtrip(tmp_path):
+    path = str(tmp_path / "profile.json")
+    save_style_profile({"sizes": ["M"], "max_price": 30.0}, path)
+    loaded = load_style_profile(path)
+    assert loaded["sizes"] == ["M"]
+    assert loaded["max_price"] == 30.0
+    # Missing keys are backfilled from the default.
+    assert loaded["preferred_styles"] == []
+
+
+def test_style_profile_update_persists_across_loads(tmp_path):
+    path = str(tmp_path / "profile.json")
+    parsed = {"description": "vintage graphic tee", "size": "M", "max_price": 30.0}
+    update_style_profile_from_query(parsed, path)
+    # A fresh load (simulating a new session) sees the remembered preferences.
+    reloaded = load_style_profile(path)
+    assert "M" in reloaded["sizes"]
+    assert reloaded["max_price"] == 30.0
+    assert "vintage" in reloaded["preferred_styles"]
+
+
+def test_style_profile_corrupt_file_returns_default(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("{not valid json")
+    profile = load_style_profile(str(path))
+    assert profile["sizes"] == []  # falls back to default, no crash

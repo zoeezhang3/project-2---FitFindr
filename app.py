@@ -63,7 +63,17 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
     # 5. Success path: format the selected listing and return all three panels.
     item = session["selected_item"]
     brand = item["brand"] or "Unbranded"
-    listing_text = (
+
+    # Feature 7: if the search was broadened, tell the user what was adjusted.
+    adjustment_note = ""
+    if session.get("adjustments"):
+        adjustment_note = (
+            "⚠️ No exact match — broadened your search: "
+            + "; ".join(session["adjustments"])
+            + ".\n\n"
+        )
+
+    listing_text = adjustment_note + (
         f"{item['title']}\n"
         f"${item['price']:.0f} · {item['platform']} · {item['condition']} condition\n"
         f"Size: {item['size']} · Brand: {brand}\n"

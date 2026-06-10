@@ -43,8 +43,48 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
+        "adjustments": [],           # notes about loosened constraints (Feature 7)
         "error": None,               # set if the interaction ended early
     }
+
+
+# ── search with retry/fallback (Feature 7) ──────────────────────────────────────
+
+def _search_with_fallback(parsed: dict, session: dict) -> list[dict]:
+    """
+    Run search_listings, automatically loosening constraints if nothing matches.
+
+    Tries, in order: (1) all filters, (2) drop size, (3) drop size + price.
+    Records a human-readable note in session["adjustments"] for each loosening
+    that finally produced results. Returns the first non-empty result list, or
+    [] if every attempt is empty.
+    """
+    description = parsed["description"]
+    size = parsed["size"]
+    max_price = parsed["max_price"]
+
+    # Attempt 1: exact constraints.
+    results = search_listings(description, size, max_price)
+    if results:
+        return results
+
+    # Attempt 2: drop the size filter (only meaningful if one was set).
+    if size is not None:
+        results = search_listings(description, None, max_price)
+        if results:
+            session["adjustments"].append(f"ignored the size {size} filter")
+            return results
+
+    # Attempt 3: drop the price filter too (only meaningful if one was set).
+    if max_price is not None:
+        results = search_listings(description, None, None)
+        if results:
+            if size is not None:
+                session["adjustments"].append(f"ignored the size {size} filter")
+            session["adjustments"].append(f"ignored the under-${max_price:.0f} budget")
+            return results
+
+    return results  # still empty
 
 
 # ── query parsing ─────────────────────────────────────────────────────────────
@@ -158,24 +198,15 @@ def run_agent(query: str, wardrobe: dict) -> dict:
         )
         return session
 
-    # Step 3: search the listings.
-    results = search_listings(
-        parsed["description"], parsed["size"], parsed["max_price"]
-    )
+    # Step 3: search the listings, with automatic retry/fallback (Feature 7).
+    results = _search_with_fallback(parsed, session)
     session["search_results"] = results
 
-    # Branch B: no matches — stop before suggest_outfit, do NOT pass empty input on.
+    # Branch B: still no matches after loosening — stop before suggest_outfit.
     if not results:
-        filters = []
-        if parsed["max_price"] is not None:
-            filters.append(f"under ${parsed['max_price']:.0f}")
-        if parsed["size"] is not None:
-            filters.append(f"in size {parsed['size']}")
-        filter_text = " ".join(filters)
         session["error"] = (
-            f"No matches for '{parsed['description']}'"
-            f"{' ' + filter_text if filter_text else ''}. "
-            "Want me to raise the budget, drop the size filter, or try broader keywords?"
+            f"No matches for '{parsed['description']}', even after dropping the "
+            "size and price filters. Try broader or different keywords."
         )
         return session
 

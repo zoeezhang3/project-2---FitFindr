@@ -10,9 +10,17 @@ Tools:
     search_listings(description, size, max_price)  → list[dict]
     suggest_outfit(new_item, wardrobe)              → str
     create_fit_card(outfit, new_item)               → str
+
+Stretch tools:
+    estimate_price_fairness(item)                   → dict
+    save_style_profile / load_style_profile / update_style_profile_from_query
+    get_trending_styles(size, top_n)                → dict
 """
 
+import json
 import os
+from collections import Counter
+from statistics import median
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -248,3 +256,192 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
     )
 
     return response.choices[0].message.content.strip()
+
+
+# ── Tool 4: estimate_price_fairness (price comparison) ──────────────────────────
+
+def estimate_price_fairness(item: dict) -> dict:
+    """
+    Estimate whether a listing's price is fair, by comparing it to comparable
+    items in the dataset (same category, weighted toward shared style_tags).
+
+    Args:
+        item: A listing dict (e.g. session["selected_item"]). Uses category,
+              style_tags, and price.
+
+    Returns:
+        A dict with keys: verdict, item_price, comp_count, comp_median,
+        comp_low, comp_high, summary. `verdict` is one of "great deal", "fair",
+        "overpriced", or "no comparables". Never raises; never divides by zero.
+    """
+    item_price = float(item["price"])
+    item_tags = set(item.get("style_tags", []))
+
+    # Comparables: same category, excluding the item itself.
+    comps = [
+        l
+        for l in load_listings()
+        if l["category"] == item["category"] and l["id"] != item.get("id")
+    ]
+
+    # If any comps share style tags, prefer those — they're truer comparables.
+    tagged = [l for l in comps if item_tags & set(l["style_tags"])]
+    pool = tagged if tagged else comps
+
+    if not pool:
+        return {
+            "verdict": "no comparables",
+            "item_price": item_price,
+            "comp_count": 0,
+            "comp_median": None,
+            "comp_low": None,
+            "comp_high": None,
+            "summary": (
+                f"No comparable {item['category']} listings to price-check "
+                f"'{item['title']}' against."
+            ),
+        }
+
+    prices = [float(l["price"]) for l in pool]
+    comp_median = median(prices)
+    comp_low, comp_high = min(prices), max(prices)
+
+    if item_price <= comp_median * 0.85:
+        verdict = "great deal"
+    elif item_price >= comp_median * 1.15:
+        verdict = "overpriced"
+    else:
+        verdict = "fair"
+
+    summary = (
+        f"${item_price:.0f} is a {verdict} — comparable {item['category']} "
+        f"run ${comp_low:.0f}–${comp_high:.0f} (median ${comp_median:.0f}, "
+        f"{len(pool)} items)."
+    )
+
+    return {
+        "verdict": verdict,
+        "item_price": item_price,
+        "comp_count": len(pool),
+        "comp_median": comp_median,
+        "comp_low": comp_low,
+        "comp_high": comp_high,
+        "summary": summary,
+    }
+
+
+# ── Tool 5: style profile memory (cross-session persistence) ────────────────────
+
+_PROFILE_PATH = os.path.join(os.path.dirname(__file__), "style_profile.json")
+
+
+def _default_profile() -> dict:
+    """A blank profile — what a first-time user gets."""
+    return {
+        "preferred_styles": [],
+        "sizes": [],
+        "max_price": None,
+        "wardrobe": {"items": []},
+    }
+
+
+def load_style_profile(path: str | None = None) -> dict:
+    """
+    Load the user's saved style profile from disk.
+
+    A missing or corrupt file is NOT an error — returns a default empty
+    profile so a first-time user behaves like the empty-wardrobe path.
+    """
+    path = path or _PROFILE_PATH
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Merge onto defaults so missing keys are always present.
+        profile = _default_profile()
+        profile.update(data)
+        return profile
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return _default_profile()
+
+
+def save_style_profile(profile: dict, path: str | None = None) -> str:
+    """
+    Persist the style profile to disk as JSON. Returns a confirmation string;
+    on write error returns an error message string rather than raising.
+    """
+    path = path or _PROFILE_PATH
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(profile, f, indent=2)
+        return f"Saved style profile to {path}."
+    except OSError as e:
+        return f"Couldn't save style profile: {e}"
+
+
+def update_style_profile_from_query(parsed: dict, path: str | None = None) -> dict:
+    """
+    Merge a parsed query (size / max_price / description keywords) into the
+    stored profile and save it. Returns the merged profile.
+
+    De-dupes sizes and style keywords; keeps the most recent max_price.
+    """
+    profile = load_style_profile(path)
+
+    size = parsed.get("size")
+    if size and size not in profile["sizes"]:
+        profile["sizes"].append(size)
+
+    if parsed.get("max_price") is not None:
+        profile["max_price"] = parsed["max_price"]
+
+    # Treat description words as soft style signals.
+    for word in (parsed.get("description") or "").lower().split():
+        if word and word not in profile["preferred_styles"]:
+            profile["preferred_styles"].append(word)
+
+    save_style_profile(profile, path)
+    return profile
+
+
+# ── Tool 6: get_trending_styles (trend awareness) ───────────────────────────────
+
+def get_trending_styles(size: str | None = None, top_n: int = 5) -> dict:
+    """
+    Surface the styles trending in a given size range.
+
+    NOTE: This is a mock stand-in for a real public-platform API (e.g. Depop /
+    Poshmark trending tags). It derives "trending" by tallying the most common
+    style_tags across local listings that match the size, so it runs offline and
+    deterministically — but the signature is shaped so a live API could replace
+    the body later.
+
+    Args:
+        size:  Size to scope the scan to (case-insensitive substring match).
+               None scans the whole dataset.
+        top_n: How many trending tags to return.
+
+    Returns:
+        A dict: {size, sample_size, trending (list[(tag, count)]), summary}.
+        Never raises; returns an empty trend list if no listings match the size.
+    """
+    listings = load_listings()
+    if size is not None:
+        needle = size.strip().lower()
+        listings = [l for l in listings if needle in l["size"].lower()]
+
+    counts = Counter(tag for l in listings for tag in l["style_tags"])
+    trending = counts.most_common(top_n)
+
+    scope = f"in size {size}" if size else "right now"
+    if not trending:
+        summary = f"Not enough listings {scope} to call a trend yet."
+    else:
+        tag_list = ", ".join(tag for tag, _ in trending)
+        summary = f"Trending {scope}: {tag_list}."
+
+    return {
+        "size": size,
+        "sample_size": len(listings),
+        "trending": trending,
+        "summary": summary,
+    }
