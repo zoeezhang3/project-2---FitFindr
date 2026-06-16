@@ -15,6 +15,7 @@ but check your terminal — the port may differ).
 import gradio as gr
 
 from agent import run_agent
+from tools import estimate_price_fairness, get_trending_styles
 from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
 
 
@@ -80,6 +81,14 @@ def handle_query(user_query: str, wardrobe_choice: str) -> tuple[str, str, str]:
         f"Colors: {', '.join(item['colors'])}\n\n"
         f"{item['description']}"
     )
+
+    # Tool 4: price-fairness check against comparable listings.
+    listing_text += f"\n\n💰 {estimate_price_fairness(item)['summary']}"
+
+    # Tool 6: what's trending in the user's requested size range (whole dataset
+    # if they didn't specify a size).
+    trend_size = session.get("parsed", {}).get("size")
+    listing_text += f"\n📈 {get_trending_styles(size=trend_size)['summary']}"
 
     return listing_text, session["outfit_suggestion"], session["fit_card"]
 
